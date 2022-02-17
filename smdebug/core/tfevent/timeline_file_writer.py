@@ -128,11 +128,27 @@ class TimelineFileWriter:
         """
         self.start_time_since_epoch_in_micros = int(round(time.time() * CONVERT_TO_MICROSECS))
         self._profiler_config_parser = profiler_config_parser
-        self._event_queue = six.moves.queue.Queue(max_queue)
+        self._max_queue = max_queue
+        self._flush_secs = 1
+        self._flush_complete = threading.Event()
+        self._flush_sentinel = object()
+        self._close_sentinel = object()
         self._sentinel_event = _get_sentinel_event(self.start_time_since_epoch_in_micros)
+        self._initialize(suffix)
+        self._closed = False
+
+    def _initialize(self, suffix):
+        """Initializes or re-initializes the queue and writer thread.
+        The EventsWriter itself does not need to be re-initialized explicitly,
+        because it will auto-initialize itself if used after being closed.
+        """
+        self._event_queue = CloseableQueue(self._max_queue)
         self._worker = _TimelineLoggerThread(
             queue=self._event_queue,
-            sentinel_event=self._sentinel_event,
+            flush_secs=self._flush_secs,
+            flush_complete=self._flush_complete,
+            flush_sentinel=self._flush_sentinel,
+            close_sentinel=self._close_sentinel,
             base_start_time_in_us=self.start_time_since_epoch_in_micros,
             profiler_config_parser=self._profiler_config_parser,
             suffix=suffix,
@@ -174,23 +190,52 @@ class TimelineFileWriter:
             duration=duration_in_us,
             base_start_time=self.start_time_since_epoch_in_micros,
         )
-        self.write_event(event)
+        self._try_put(event)
+
+    def _try_put(self, item):
+        """Attempts to enqueue an item to the event queue.
+        If the queue is closed, this will close the EventFileWriter and reraise the
+        exception that caused the queue closure, if one exists.
+        Args:
+          item: the item to enqueue
+        """
+        try:
+            self._event_queue.put(item)
+        except QueueClosedError:
+            self._internal_close()
+            if self._worker.failure_exc_info:
+                six.reraise(*self._worker.failure_exc_info)  # pylint: disable=no-value-for-parameter
 
     def write_event(self, event):
         """Adds a trace event to the JSON file."""
-        self._event_queue.put(event)
+        self._try_put(event)
 
     def flush(self):
         """Flushes the trace event file to disk.
         Call this method to make sure that all pending events have been written to disk.
         """
-        self._event_queue.join()
-        self._worker.flush()
+        if not self._closed:
+            # Request a flush operation by enqueing a sentinel and then waiting for
+            # the writer thread to mark the flush as complete.
+            self._flush_complete.clear()
+            self._try_put(self._flush_sentinel)
+            self._flush_complete.wait()
+            if self._worker.failure_exc_info:
+              self._internal_close()
+              six.reraise(*self._worker.failure_exc_info)  # pylint: disable=no-value-for-parameter
 
     def close(self):
         """Flushes the trace event file to disk and close the file.
         """
-        self.write_event(self._sentinel_event)
+        if not self._closed:
+            self.flush()
+            self._try_put(self._close_sentinel)
+            self._internal_close()
+
+    def _internal_close(self):
+        """Flushes the trace event file to disk and close the file.
+        """
+        self._closed = True
         self._worker.join()
         self._worker.close()
 
@@ -202,7 +247,10 @@ class _TimelineLoggerThread(threading.Thread):
     def __init__(
         self,
         queue,
-        sentinel_event,
+        flush_secs,
+        flush_complete,
+        flush_sentinel,
+        close_sentinel,
         base_start_time_in_us,
         profiler_config_parser,
         verbose=False,
@@ -212,7 +260,11 @@ class _TimelineLoggerThread(threading.Thread):
         threading.Thread.__init__(self)
         self.daemon = True
         self._queue = queue
-        self._sentinel_event = sentinel_event
+        self._flush_secs = flush_secs
+        self._next_event_flush_time = 0
+        self._flush_complete = flush_complete
+        self._flush_sentinel = flush_sentinel
+        self._close_sentinel = close_sentinel
         self._num_outstanding_events = 0
         self._writer = None
         self.verbose = verbose
@@ -231,6 +283,7 @@ class _TimelineLoggerThread(threading.Thread):
         self._profiler_config_parser = profiler_config_parser
         self.node_id = get_node_id()
         self.suffix = suffix
+        self.failure_exc_info = ()
 
     def _update_base_start_time(self, base_start_time_in_us):
         """
@@ -245,29 +298,45 @@ class _TimelineLoggerThread(threading.Thread):
         ).hour
 
     def run(self):
-        while True:
-            # if there is long interval between 2 events, just keep checking if
-            # the file is still open. if it is open for too long and a new event
-            # has not occurred, close the open file based on rotation policy.
-            if self._writer and self._should_rotate_now(time.time() * CONVERT_TO_MICROSECS):
-                self.close()
+        try:
+            while True:
+                # if there is long interval between 2 events, just keep checking if
+                # the file is still open. if it is open for too long and a new event
+                # has not occurred, close the open file based on rotation policy.
+                if self._writer and self._should_rotate_now(time.time() * CONVERT_TO_MICROSECS):
+                    self.close()
 
-            event = self._queue.get()
+                event = self._queue.get()
 
-            if (
-                not self._healthy
-                or not self._profiler_config_parser.profiling_enabled
-                or event is self._sentinel_event
-            ):
-                self._queue.task_done()
-                break
+                if event is self._close_sentinel:
+                    return
+                elif event is self._flush_sentinel:
+                    self.flush()
+                    self._flush_complete.set()
+                else:
 
-            try:
-                # write event
-                _ = self.write_event(event)
-            finally:
-                self._queue.task_done()
-            time.sleep(0)
+                    if (
+                        not self._healthy
+                        or not self._profiler_config_parser.profiling_enabled
+                        or event is self._sentinel_event
+                    ):
+                        #self._queue.task_done()
+                        break
+
+                    # write event
+                    _ = self.write_event(event)
+                    now = time.time()
+                    if now > self._next_event_flush_time:
+                        self.flush()
+                        self._next_event_flush_time = now + self._flush_secs
+                    #self._queue.task_done()
+        except Exception as e:
+            #logging.error("EventFileWriter writer thread error: %s", e)
+            raise
+        finally:
+            self._flush_complete.set()
+            self._queue.close()
+
 
     def open(self, path, cur_event_end_time):
         """
@@ -453,3 +522,67 @@ class _TimelineLoggerThread(threading.Thread):
 
     def file_size(self):
         return os.path.getsize(self.name())  # in bytes
+
+class CloseableQueue(object):
+  """Stripped-down fork of the standard library Queue that is closeable."""
+
+  def __init__(self, maxsize=0):
+    """Create a queue object with a given maximum size.
+    Args:
+      maxsize: int size of queue. If <= 0, the queue size is infinite.
+    """
+    self._maxsize = maxsize
+    self._queue = collections.deque()
+    self._closed = False
+    # Mutex must be held whenever queue is mutating; shared by conditions.
+    self._mutex = threading.Lock()
+    # Notify not_empty whenever an item is added to the queue; a
+    # thread waiting to get is notified then.
+    self._not_empty = threading.Condition(self._mutex)
+    # Notify not_full whenever an item is removed from the queue;
+    # a thread waiting to put is notified then.
+    self._not_full = threading.Condition(self._mutex)
+
+  def get(self):
+    """Remove and return an item from the queue.
+    If the queue is empty, blocks until an item is available.
+    Returns:
+      an item from the queue
+    """
+    with self._not_empty:
+      while not self._queue:
+        self._not_empty.wait()
+      item = self._queue.popleft()
+      self._not_full.notify()
+      return item
+
+  def put(self, item):
+    """Put an item into the queue.
+    If the queue is closed, fails immediately.
+    If the queue is full, blocks until space is available or until the queue
+    is closed by a call to close(), at which point this call fails.
+    Args:
+      item: an item to add to the queue
+    Raises:
+      QueueClosedError: if insertion failed because the queue is closed
+    """
+    with self._not_full:
+      if self._closed:
+        raise QueueClosedError()
+      if self._maxsize > 0:
+        while len(self._queue) == self._maxsize:
+          self._not_full.wait()
+          if self._closed:
+            raise QueueClosedError()
+      self._queue.append(item)
+      self._not_empty.notify()
+
+  def close(self):
+    """Closes the queue, causing any pending or future `put()` calls to fail."""
+    with self._not_full:
+      self._closed = True
+      self._not_full.notify_all()
+
+
+class QueueClosedError(Exception):
+  """Raised when CloseableQueue.put() fails because the queue is closed."""

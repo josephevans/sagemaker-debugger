@@ -28,6 +28,7 @@ import six
 from smdebug.core.locations import TensorLocation
 from smdebug.core.tfevent.events_writer import EventsWriter
 from smdebug.core.tfevent.index_file_writer import EventWithIndex
+from smdebug.core.tfevent.timeline_file_writer import CloseableQueue
 from smdebug.core.tfevent.proto.event_pb2 import Event
 from smdebug.core.utils import get_relative_event_file_path, parse_worker_name_from_file
 
@@ -69,7 +70,7 @@ class EventFileWriter:
         the event file:
         """
         self._path = path
-        self._event_queue = six.moves.queue.Queue(max_queue)
+        self._max_queue = max_queue
         self._ev_writer = EventsWriter(
             path=self._path,
             index_writer=index_writer,
@@ -78,11 +79,22 @@ class EventFileWriter:
         )
         self._ev_writer.init()
         self._flush_secs = flush_secs
+        self._flush_complete = threading.Event()
+        self._flush_sentinel = object()
+        self._close_sentinel = object()
         self._sentinel_event = _get_sentinel_event()
+        self._initialize()
+        self._closed = False
+
+    def _initialize(self):
+        self._event_queue = CloseableQueue(self._max_queue)
         self._worker = _EventLoggerThread(
             queue=self._event_queue,
             ev_writer=self._ev_writer,
             flush_secs=self._flush_secs,
+            flush_complete=self._flush_complete,
+            flush_sentinel=self._flush_sentinel,
+            close_sentinel=self._close_sentinel,
             sentinel_event=self._sentinel_event,
         )
         self._worker.start()
@@ -91,6 +103,14 @@ class EventFileWriter:
         """Adds a `Graph` protocol buffer to the event file."""
         event = Event(graph_def=graph.SerializeToString())
         self.write_event(event)
+
+    def _try_put(self, item):
+        try:
+            self._event_queue.put(item)
+        except QueueClosedError:
+            self._internal_close()
+            if self._worker.failure_exc_info:
+                six.reraise(*self._worker.failure_exc_info)  # pylint: disable=no-value-for-parameter
 
     def write_summary(self, summary, step, timestamp=None):
         event = Event(summary=summary)
@@ -106,21 +126,35 @@ class EventFileWriter:
 
     def write_event(self, event):
         """Adds an event to the event file."""
-        self._event_queue.put(event)
+        self._try_put(event)
 
     def flush(self):
         """Flushes the event file to disk.
         Call this method to make sure that all pending events have been written to disk.
         """
-        self._event_queue.join()
-        self._ev_writer.flush()
+        if not self._closed:
+            # Request a flush operation by enqueing a sentinel and then waiting for
+            # the writer thread to mark the flush as complete.
+            self._flush_complete.clear()
+            self._try_put(self._flush_sentinel)
+            self._flush_complete.wait()
+            if self._worker.failure_exc_info:
+              self._internal_close()
+              six.reraise(*self._worker.failure_exc_info)  # pylint: disable=no-value-for-parameter
 
     def close(self):
         """Flushes the event file to disk and close the file.
         Call this method when you do not need the summary writer anymore.
         """
-        self.write_event(self._sentinel_event)
-        self.flush()
+        if not self._closed:
+            self.flush()
+            self._try_put(self._close_sentinel)
+            self._internal_close()
+
+    def _internal_close(self):
+        """Flushes the trace event file to disk and close the file.
+        """
+        self._closed = True
         self._worker.join()
         self._ev_writer.close()
 
@@ -132,54 +166,66 @@ class _EventLoggerThread(threading.Thread):
     """Thread that logs events. Copied from
     https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/summary/writer/event_file_writer.py#L133"""
 
-    def __init__(self, queue, ev_writer, flush_secs, sentinel_event):
+    def __init__(self, queue, ev_writer, flush_secs, flush_complete, flush_sentinel, close_sentinel):
         """Creates an _EventLoggerThread."""
         threading.Thread.__init__(self)
         self.daemon = True
         self._queue = queue
         self._ev_writer = ev_writer
         self._flush_secs = flush_secs
+        self._flush_complete = flush_complete
+        self._flush_sentinel = flush_sentinel
+        self._close_sentinel = close_sentinel
         # The first event will be flushed immediately.
         self._next_event_flush_time = 0
-        self._sentinel_event = sentinel_event
+        self.failure_exc_info = ()
 
     def run(self):
-        while True:
-            event_in_queue = self._queue.get()
+        try:
+            while True:
+                event_in_queue = self._queue.get()
 
-            if isinstance(event_in_queue, EventWithIndex):
-                # checking whether there is an object of EventWithIndex,
-                # which is written by write_summary_with_index
-                event = event_in_queue.event
-            else:
-                event = event_in_queue
-
-            if event is self._sentinel_event:
-                self._queue.task_done()
-                break
-            try:
-                # write event
-                positions = self._ev_writer.write_event(event)
-
-                # write index
-                if isinstance(event_in_queue, EventWithIndex):
-                    eventfile = self._ev_writer.name()
-                    eventfile = get_relative_event_file_path(eventfile)
-                    tensorlocation = TensorLocation(
-                        tname=event_in_queue.tensorname,
-                        mode=event_in_queue.get_mode(),
-                        mode_step=event_in_queue.mode_step,
-                        event_file_name=eventfile,
-                        start_idx=positions[0],
-                        length=positions[1],
-                        worker=parse_worker_name_from_file(eventfile),
-                    )
-                    self._ev_writer.index_writer.add_index(tensorlocation)
-                # Flush the event writer every so often.
-                now = time.time()
-                if now > self._next_event_flush_time:
+                if event_in_queue is self._close_sentinel:
+                    return
+                elif event_in_queue is self._flush_sentinel:
                     self._ev_writer.flush()
-                    # Do it again in two minutes.
-                    self._next_event_flush_time = now + self._flush_secs
-            finally:
-                self._queue.task_done()
+                    self._flush_complete.set()
+                else:
+                    if isinstance(event_in_queue, EventWithIndex):
+                        # checking whether there is an object of EventWithIndex,
+                        # which is written by write_summary_with_index
+                        event = event_in_queue.event
+                    else:
+                        event = event_in_queue
+
+                    if event is self._sentinel_event:
+                        break
+                    try:
+                        # write event
+                        positions = self._ev_writer.write_event(event)
+
+                        # write index
+                        if isinstance(event_in_queue, EventWithIndex):
+                            eventfile = self._ev_writer.name()
+                            eventfile = get_relative_event_file_path(eventfile)
+                            tensorlocation = TensorLocation(
+                                tname=event_in_queue.tensorname,
+                                mode=event_in_queue.get_mode(),
+                                mode_step=event_in_queue.mode_step,
+                                event_file_name=eventfile,
+                                start_idx=positions[0],
+                                length=positions[1],
+                                worker=parse_worker_name_from_file(eventfile),
+                            )
+                            self._ev_writer.index_writer.add_index(tensorlocation)
+                        # Flush the event writer every so often.
+                        now = time.time()
+                        if now > self._next_event_flush_time:
+                            self._ev_writer.flush()
+                            # Do it again in two minutes.
+                            self._next_event_flush_time = now + self._flush_secs
+        except:
+            raise
+        finally:
+            self._flush_complete.set()
+            self._queue.close()
